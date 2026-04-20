@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>雨量筒水位模擬</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body {
+  background:#1a1a2e;
+  color:#eee;
+  font-family:'Microsoft JhengHei',Arial,sans-serif;
+  display:flex; flex-direction:column; align-items:center;
+  padding:16px; min-height:100vh;
+}
+h1 { font-size:1.5em; margin-bottom:14px; color:#7ecef4; letter-spacing:2px; }
+canvas { border-radius:12px; box-shadow:0 4px 28px rgba(0,0,0,0.7); max-width:100%; }
+.controls {
+  display:flex; gap:12px; margin-top:14px;
+  align-items:center; flex-wrap:wrap; justify-content:center;
+}
+button {
+  padding:9px 22px; border:none; border-radius:8px;
+  font-size:1em; font-family:inherit; cursor:pointer; font-weight:bold;
+  transition:transform .1s,filter .1s;
+}
+button:hover { transform:translateY(-2px); filter:brightness(1.15); }
+#btnToggle { background:#27ae60; color:#fff; }
+#btnReset  { background:#2980b9; color:#fff; }
+.sbox {
+  background:rgba(255,255,255,.1); border-radius:8px;
+  padding:8px 16px; display:flex; align-items:center; gap:10px;
+}
+input[type=range] { width:100px; cursor:pointer; }
+.legend {
+  margin-top:12px; display:flex; gap:22px; font-size:.85em;
+  background:rgba(255,255,255,.07); padding:9px 18px; border-radius:8px;
+  flex-wrap:wrap; justify-content:center;
+}
+.legend span { display:flex; align-items:center; gap:6px; }
+.dot { width:11px; height:11px; border-radius:50%; display:inline-block; }
+</style>
+</head>
+<body>
+<h1>☁️ 雨量筒水位模擬</h1>
+<canvas id="cv" width="900" height="490"></canvas>
+<div class="controls">
+  <button id="btnToggle" onclick="toggleRain()">▶ 開始下雨</button>
+  <button id="btnReset"  onclick="resetSim()">↺ 重置</button>
+  <div class="sbox">
+    <label>雨量強度：</label>
+    <input type="range" id="rslider" min="1" max="10" value="4" oninput="setRate(this.value)">
+    <span id="rlabel">中雨</span>
+  </div>
+</div>
+<div class="legend">
+  <span><i class="dot" style="background:#3498db"></i>水位相同（A、C、F）— 等寬容器，水位＝實際雨量深度</span>
+  <span><i class="dot" style="background:#e74c3c"></i>水位不同（B、D、E）— 非等寬容器，讀數有誤差</span>
+</div>
+
+<script>
+const cv  = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const CW = cv.width, CH = cv.height;
+const GY = 380;   // ground y
+const SC = 0.85;  // px→mm scale for display
+
+// ── state ──────────────────────────────────────────────────────────────
+let rain = 0;       // cumulative depth (px)
+let running = false;
+let lastT = null;
+let rate = 0.016;   // px per ms
+
+// ── rain particles ──────────────────────────────────────────────────────
+let drops = [];
+function initDrops() {
+  drops = Array.from({length:100}, ()=>({
+    x: Math.random()*CW,
+    y: Math.random()*GY,
+    spd: 3.5+Math.random()*3,
+    len: 7+Math.random()*11,
+    op: 0.35+Math.random()*0.45
+  }));
+}
+initDrops();
+
+// ── containers ──────────────────────────────────────────────────────────
+// profile: [{y,w}] y from bottom=0, opening = last entry
+const CONTS = [
+  { id:'A', top:'A', bot:'矮寬圓柱', note:'等寬容器',  cx:78,  same:true,
+    profile:[{y:0,w:88},{y:112,w:88}] },
+
+  { id:'B', top:'B', bot:'寶特瓶',   note:'瓶口窄‧瓶身寬', cx:198, same:false,
+    profile:[{y:0,w:76},{y:80,w:76},{y:100,w:30},{y:150,w:30}] },
+
+  { id:'C', top:'C', bot:'高圓柱',   note:'等寬容器',  cx:308, same:true,
+    profile:[{y:0,w:52},{y:160,w:52}] },
+
+  { id:'D', top:'D', bot:'漸寬杯',   note:'下窄上寬',  cx:418, same:false,
+    profile:[{y:0,w:46},{y:148,w:84}] },
+
+  { id:'E', top:'E', bot:'錐形杯',   note:'底尖漸寬',  cx:542, same:false,
+    profile:[{y:0,w:20},{y:132,w:80}] },
+
+  { id:'F', top:'F', bot:'寬淺盆',   note:'等寬容器',  cx:688, same:true,
+    profile:[{y:0,w:128},{y:88,w:128}] }
+];
+
+// width at height y (linear interp)
+function wAt(c, y) {
+  const p = c.profile;
+  if (y<=0) return p[0].w;
+  const top = p[p.length-1].y;
+  if (y>=top) return p[p.length-1].w;
+  for (let i=0;i<p.length-1;i++) {
+    if (y>=p[i].y && y<=p[i+1].y) {
+      const t=(y-p[i].y)/(p[i+1].y-p[i].y);
+      return p[i].w*(1-t)+p[i+1].w*t;
+    }
+  }
+  return p[0].w;
+}
+
+// volume up to h (numeric trapezoid)
+function volAt(c, h) {
+  if (h<=0) return 0;
+  const N=200, dy=h/N; let v=0;
+  for (let i=0;i<N;i++) v+=wAt(c,i*dy+dy/2)*dy;
+  return v;
+}
+function maxVol(c){ return volAt(c,c.profile[c.profile.length-1].y); }
+
+// height from volume (binary search)
+function hFromVol(c, V) {
+  if (V<=0) return 0;
+  if (V>=maxVol(c)) return c.profile[c.profile.length-1].y+0.01;
+  const mH=c.profile[c.profile.length-1].y;
+  let lo=0,hi=mH;
+  for (let i=0;i<48;i++){
+    const mid=(lo+hi)/2;
+    volAt(c,mid)<V ? lo=mid : hi=mid;
+  }
+  return (lo+hi)/2;
+}
+
+function waterH(c) {
+  const opening = wAt(c, c.profile[c.profile.length-1].y);
+  return hFromVol(c, rain*opening);
+}
+
+// ── drawing helpers ─────────────────────────────────────────────────────
+function rr(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y);
+  ctx.arcTo(x+w,y,x+w,y+r,r); ctx.lineTo(x+w,y+h-r);
+  ctx.arcTo(x+w,y+h,x+w-r,y+h,r); ctx.lineTo(x+r,y+h);
+  ctx.arcTo(x,y+h,x,y+h-r,r); ctx.lineTo(x,y+r);
+  ctx.arcTo(x,y,x+r,y,r); ctx.closePath();
+}
+
+function drawSky(){
+  const g=ctx.createLinearGradient(0,0,0,GY);
+  g.addColorStop(0,'#111c38'); g.addColorStop(1,'#2e5991');
+  ctx.fillStyle=g; ctx.fillRect(0,0,CW,GY);
+}
+
+function drawTable(){
+  const g=ctx.createLinearGradient(0,GY,0,CH);
+  g.addColorStop(0,'#7a5c0e'); g.addColorStop(1,'#3a2a05');
+  ctx.fillStyle=g; ctx.fillRect(0,GY,CW,CH-GY);
+  ctx.strokeStyle='rgba(255,210,80,.25)'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.moveTo(0,GY); ctx.lineTo(CW,GY); ctx.stroke();
+  ctx.strokeStyle='rgba(0,0,0,.12)'; ctx.lineWidth=1;
+  for(let y=GY+10;y<CH;y+=11){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(CW,y); ctx.stroke(); }
+}
+
+function drawRainDrops(){
+  if(!running) return;
+  drops.forEach(d=>{
+    ctx.strokeStyle=`rgba(180,220,255,${d.op})`;
+    ctx.lineWidth=1.3;
+    ctx.beginPath(); ctx.moveTo(d.x,d.y); ctx.lineTo(d.x-1.5,d.y+d.len); ctx.stroke();
+  });
+}
+
+function updateDrops(dt){
+  const m=rate/0.016;
+  drops.forEach(d=>{
+    d.y+=d.spd*m*dt/16;
+    if(d.y>GY+5){ d.y=-d.len-Math.random()*60; d.x=Math.random()*CW; }
+  });
+}
+
+// yellow reference line = actual rainfall depth
+function drawRefLine(){
+  if(rain<3) return;
+  const ry=GY-Math.min(rain, GY-30);
+  ctx.save();
+  ctx.setLineDash([10,7]);
+  ctx.strokeStyle='rgba(255,230,30,.5)';
+  ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(20,ry); ctx.lineTo(CW-20,ry); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle='rgba(255,230,30,.75)';
+  ctx.font='11px Microsoft JhengHei';
+  ctx.textAlign='left';
+  ctx.fillText(`實際雨量深度 ${(rain*SC).toFixed(1)} mm`+
+    (rain>5?' ← A、C、F 水位對齊此線':''), 22, ry-4);
+}
+
+function drawContainer(c){
+  const p=c.profile;
+  const cx2=c.cx;
+  const maxH=p[p.length-1].y;
+  const wh=waterH(c);
+  const overflow=wh>maxH;
+  const dh=Math.min(wh,maxH);
+
+  // ── water fill (clipped to container shape) ──
+  if(dh>0.5){
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(cx2-p[0].w/2, GY);
+    for(let i=0;i<p.length;i++) ctx.lineTo(cx2+p[i].w/2, GY-p[i].y);
+    for(let i=p.length-1;i>=0;i--) ctx.lineTo(cx2-p[i].w/2, GY-p[i].y);
+    ctx.closePath();
+    ctx.clip();
+
+    const g=ctx.createLinearGradient(cx2,GY-dh,cx2,GY);
+    if(c.same){
+      g.addColorStop(0,'rgba(52,152,219,.9)');
+      g.addColorStop(1,'rgba(10,60,150,.95)');
+    } else {
+      g.addColorStop(0,'rgba(231,76,60,.88)');
+      g.addColorStop(1,'rgba(120,10,10,.93)');
+    }
+    ctx.fillStyle=g;
+    ctx.fillRect(cx2-150,GY-dh,300,dh);
+
+    // shimmer line at surface
+    const sw=wAt(c,dh);
+    ctx.fillStyle='rgba(255,255,255,.28)';
+    ctx.fillRect(cx2-sw/2,GY-dh,sw,3);
+    ctx.restore();
+  }
+
+  // ── container outline ──
+  const col=c.same ? '#5dade2' : '#ec7063';
+  ctx.strokeStyle=col; ctx.lineWidth=2.5;
+  // left wall
+  ctx.beginPath(); ctx.moveTo(cx2-p[0].w/2,GY);
+  for(let i=0;i<p.length;i++) ctx.lineTo(cx2-p[i].w/2,GY-p[i].y);
+  ctx.stroke();
+  // right wall
+  ctx.beginPath(); ctx.moveTo(cx2+p[0].w/2,GY);
+  for(let i=0;i<p.length;i++) ctx.lineTo(cx2+p[i].w/2,GY-p[i].y);
+  ctx.stroke();
+  // bottom
+  ctx.beginPath(); ctx.moveTo(cx2-p[0].w/2,GY); ctx.lineTo(cx2+p[0].w/2,GY); ctx.stroke();
+
+  // ── water level dashed line + mm label ──
+  if(dh>1){
+    const ly=GY-dh;
+    const sw=wAt(c,dh);
+    const mmH=(dh*SC).toFixed(0);
+    const mmR=(rain*SC).toFixed(0);
+    const correct=c.same;
+
+    ctx.save();
+    ctx.setLineDash([4,4]);
+    ctx.strokeStyle=correct?'#aed6f1':'#f1948a';
+    ctx.lineWidth=1.5;
+    ctx.beginPath(); ctx.moveTo(cx2-sw/2-6,ly); ctx.lineTo(cx2+sw/2+6,ly); ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle=correct?'#aed6f1':'#f1948a';
+    ctx.font='bold 12px Microsoft JhengHei';
+    ctx.textAlign='center';
+    ctx.fillText(`${mmH} mm`, cx2, ly-5);
+  }
+
+  // overflow badge
+  if(overflow){
+    ctx.fillStyle='#f39c12';
+    ctx.font='bold 12px Microsoft JhengHei';
+    ctx.textAlign='center';
+    ctx.fillText('⚠ 溢出！', cx2, GY-maxH-14);
+  }
+
+  // ── labels below ground ──
+  ctx.textAlign='center';
+  ctx.fillStyle='#fff';
+  ctx.font='bold 15px Microsoft JhengHei';
+  ctx.fillText(c.top, cx2, GY+20);
+  ctx.font='12px Microsoft JhengHei';
+  ctx.fillText(c.bot, cx2, GY+36);
+  ctx.fillStyle=c.same?'#85c1e9':'#f1948a';
+  ctx.font='10px Microsoft JhengHei';
+  ctx.fillText(c.note, cx2, GY+52);
+
+  // checkmark / cross (appears after rain starts)
+  if(rain>5){
+    const mark=c.same?'✔ 讀數正確':'✘ 讀數有誤';
+    ctx.fillStyle=c.same?'#2ecc71':'#e74c3c';
+    ctx.font='bold 10px Microsoft JhengHei';
+    ctx.fillText(mark, cx2, GY+65);
+  }
+}
+
+function drawInfoPanel(){
+  ctx.fillStyle='rgba(0,0,0,.5)';
+  rr(10,10,185,60,8); ctx.fill();
+  ctx.fillStyle='#85c1e9';
+  ctx.font='12px Microsoft JhengHei';
+  ctx.textAlign='left';
+  ctx.fillText('☔ 累積雨量深度', 18,30);
+  ctx.fillStyle='#fff';
+  ctx.font='bold 22px Microsoft JhengHei';
+  ctx.fillText(`${(rain*SC).toFixed(1)} mm`, 18,55);
+}
+
+function draw(){
+  ctx.clearRect(0,0,CW,CH);
+  drawSky();
+  drawRainDrops();
+  drawTable();
+  drawRefLine();
+  CONTS.forEach(c=>drawContainer(c));
+  drawInfoPanel();
+}
+
+function animate(ts){
+  if(running){
+    if(lastT!==null){
+      const dt=Math.min(ts-lastT,50);
+      rain+=rate*dt;
+      if(rain>200) rain=200;
+      updateDrops(dt);
+    }
+    lastT=ts;
+  } else { lastT=null; }
+  draw();
+  requestAnimationFrame(animate);
+}
+
+function toggleRain(){
+  running=!running;
+  document.getElementById('btnToggle').textContent=running?'⏸ 暫停':'▶ 繼續下雨';
+}
+function resetSim(){
+  running=false; rain=0;
+  document.getElementById('btnToggle').textContent='▶ 開始下雨';
+  initDrops(); draw();
+}
+const rmap={1:'微雨',2:'小雨',3:'小雨',4:'中雨',5:'中雨',6:'中大雨',7:'中大雨',8:'大雨',9:'大雨',10:'豪雨'};
+function setRate(v){
+  rate=v*0.004;
+  document.getElementById('rlabel').textContent=rmap[v];
+}
+
+draw();
+requestAnimationFrame(animate);
+</script>
+</body>
+</html>
